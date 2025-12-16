@@ -1,0 +1,189 @@
+name: Vercel Deployment Handler
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  handle-vercel-comment:
+    if: |
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == 'vercel[bot]'
+    
+    runs-on: ubuntu-latest
+    
+    permissions:
+      pull-requests: write
+      contents: write
+    
+    steps:
+      - name: Get PR details
+        id: pr-details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('base_ref', pr.data.base.ref);
+            core.setOutput('head_ref', pr.data.head.ref);
+            core.setOutput('pr_title', pr.data.title);
+            core.setOutput('pr_author', pr.data.user.login);
+            core.setOutput('pr_url', pr.data.html_url);
+            return pr.data;
+
+      - name: Check deployment status
+        id: check-status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body.toLowerCase();
+            const inProgress = ['building','inspecting','queued','initializing'].some(i => comment.includes(i));
+            const failed = ['status/error.svg','failed','build error','❌','canceled'].some(i => comment.includes(i));
+            const success = ['status/ready.svg','✅'].some(i => comment.includes(i));
+            let status = inProgress ? 'in_progress' : failed ? 'failed' : success ? 'success' : 'unknown';
+            core.setOutput('status', status);
+            console.log('Status:', status);
+
+      - name: Send webhook on failure
+        if: steps.check-status.outputs.status == 'failed'
+        uses: actions/github-script@v7
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        with:
+          script: |
+            const webhookUrl = process.env.WEBHOOK_URL;
+            if (!webhookUrl) return;
+            await fetch(webhookUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                event: 'vercel_deployment_failed',
+                repository: '${{ github.repository }}',
+                pr_number: context.issue.number,
+                branch: '${{ steps.pr-details.outputs.head_ref }}',
+                timestamp: new Date().toISOString()
+              })
+            }).catch(e => console.log(e.message));
+
+      - name: Checkout for migrations
+        if: steps.check-status.outputs.status == 'success' && steps.pr-details.outputs.base_ref == 'main'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr-details.outputs.head_ref }}
+
+      - name: Run migrations
+        id: migrations
+        if: steps.check-status.outputs.status == 'success' && steps.pr-details.outputs.base_ref == 'main'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🔍 Checking for new migrations in this PR..."
+          
+          CHANGED=$(gh pr view ${{ github.event.issue.number }} --json files --jq '.files[].path' | grep '^supabase/migrations/.*\.sql$' || true)
+          
+          if [ -z "$CHANGED" ]; then
+            echo "ℹ️ No migrations found"
+            echo "migration_ran=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "📦 Found migrations:"
+          echo "$CHANGED"
+          
+          echo "📥 Installing PostgreSQL client..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          
+          echo "🚀 Applying migrations..."
+          
+          for f in $CHANGED; do
+            if [ -f "$f" ]; then
+              echo "Applying: $f"
+              if psql "${SUPABASE_DB_URL}" -f "$f" -v ON_ERROR_STOP=1; then
+                echo "✅ Done: $f"
+              else
+                echo "❌ Failed: $f"
+                exit 1
+              fi
+            fi
+          done
+          
+          echo "migration_ran=true" >> $GITHUB_OUTPUT
+          echo "✅ All migrations applied"
+
+      - name: Post migration comment
+        if: steps.check-status.outputs.status == 'success' && steps.pr-details.outputs.base_ref == 'main' && steps.migrations.outputs.migration_ran == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '🗄️ **Database migrations applied**'
+            });
+
+      - name: Handle migration failure
+        if: failure() && steps.migrations.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '❌ **Database migration failed**\n\n@cursor fix the migration issue'
+            });
+
+      - name: Auto-merge
+        if: steps.check-status.outputs.status == 'success' && steps.pr-details.outputs.base_ref == 'main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            if (pr.data.draft) {
+              try {
+                await github.graphql(`
+                  mutation($id: ID!) {
+                    markPullRequestReadyForReview(input: { pullRequestId: $id }) {
+                      pullRequest { isDraft }
+                    }
+                  }
+                `, { id: pr.data.node_id });
+              } catch (e) {
+                console.log('Draft conversion failed:', e.message);
+              }
+            }
+            
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                merge_method: 'squash'
+              });
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '✅ **Merged!**\n\nVercel deployment succeeded. PR has been squash-merged.'
+              });
+            } catch (e) {
+              console.log('Merge failed:', e.message);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '⚠️ **Auto-merge failed**\n\n' + e.message + '\n\nPlease merge manually.'
+              });
+            }
